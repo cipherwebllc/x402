@@ -1,6 +1,6 @@
 # `eip3009-forwarder-split`: atomic fee-splitting settlement for the `exact` scheme on EVM
 
-Status: Proposal (spec-only PR per CONTRIBUTING "PR 1") — revision 2, addressing review
+Status: Proposal (spec-only PR per CONTRIBUTING "PR 1") — revision 3, addressing review
 Target: `specs/schemes/exact/` (extension of `scheme_exact_evm.md` via `extra.assetTransferMethod`)
 Authors: OpenPay (cipherweb LLC) — production operator of a JPY-stablecoin x402 facilitator
 
@@ -59,6 +59,10 @@ listed under *Open questions*.
 | `commitVersion` | bytes32 | Version tag of the commitment encoding (below) |
 
 `extra.name` / `extra.version` carry the token's EIP-712 domain as in `exact` today.
+`extra` is server-authored and untrusted as a source of token metadata: wallets SHOULD read
+`decimals()` from the token contract on chain (rather than relying on `extra.decimals`)
+when rendering amounts, and the EIP-712 domain check (verification rule 1) binds
+`name` / `version` to the actual contract.
 Any EIP-3009 token with standard transfer semantics works unchanged; see *Scope* under
 *Normative on-chain invariants* for the exclusions (fee-on-transfer / rebasing tokens).
 
@@ -148,13 +152,43 @@ token contract itself.
 
 ## Verification logic (facilitator / server)
 
-1. Validate the typed-data signature for the token's EIP-712 domain
-   (`primaryType: "ReceiveWithAuthorization"`).
-2. Recompute the commitment hash from `extra.forwarderSplit`, the authorization's
-   `from` / `validAfter` / `validBefore`, `intentSalt`, `chainId`, and `forwarder`, and
-   require it to equal `authorization.nonce`.
-3. Require `value == merchantValue + feeValue`, `to == forwarder == payTo`, time window
-   open, and (via RPC) that the authorization is unused.
+A facilitator verifying an `eip3009-forwarder-split` payment MUST reject any payload that
+fails any rule below. `PaymentRequirements` means the selected requirement supplied to the
+facilitator alongside the `PaymentPayload` (as in the core v2 specification).
+
+1. **Signature.** The `ReceiveWithAuthorization` typed-data signature MUST be valid for the
+   token's EIP-712 domain (`extra.name`, `extra.version`, `chainId`, `verifyingContract =
+   asset`) and MUST recover to `authorization.from`.
+2. **Commitment.** The verifier MUST recompute the commitment hash from
+   `extra.forwarderSplit`, the authorization's `from` / `validAfter` / `validBefore`,
+   `intentSalt`, `chainId`, and `forwarder`, and MUST require it to equal
+   `authorization.nonce`. `intentSalt` MUST NOT be `bytes32(0)`.
+3. **Amount.** `authorization.value` MUST equal `PaymentRequirements.amount` exactly, and
+   both MUST equal `merchantValue + feeValue`.
+4. **Destination.** `authorization.to` MUST equal `PaymentRequirements.payTo` and
+   `extra.forwarderSplit.forwarder`.
+5. **Asset and network.** `accepted.asset` and `accepted.network` MUST equal
+   `PaymentRequirements.asset` and `PaymentRequirements.network`, and the chain ID derived
+   from `network` MUST be the `chainId` used in rules 1 and 2.
+6. **Forwarder binding.** The verifier MUST confirm on chain that the forwarder is
+   configured for this requirement: its token MUST equal `asset`, and its fee receiver
+   MUST equal `extra.forwarderSplit.feeReceiver` (likewise `commitVersion`, where the
+   forwarder exposes it; the production forwarder exposes `token()`, `feeReceiver()` and
+   `COMMIT_VERSION()`). These values are immutable, so results MAY be cached per
+   (chain, forwarder). `settle()` does not take `feeReceiver`, so without this check a
+   mismatch would pass `/verify` and surface only at settlement, as an on-chain nonce
+   mismatch.
+7. **Time window.** `validAfter < now < validBefore` MUST hold at the facilitator's current
+   time (the bounds EIP-3009 tokens enforce on chain). Facilitators SHOULD also require
+   `validBefore - now` to leave a settlement margin (implementation-defined, covering
+   broadcast and inclusion). They MAY reject a `validBefore` later than
+   `now + maxTimeoutSeconds` plus a clock-skew allowance.
+8. **Unused authorization.** `authorizationState(from, nonce)` on the token MUST be
+   `false`.
+9. **Balance.** The payer's `balanceOf` for `asset` MUST be at least `authorization.value`.
+10. **Simulation.** The facilitator SHOULD simulate `forwarder.settle(...)` (for example
+    with `eth_call`) using the exact settlement arguments before returning
+    `isValid: true`. A facilitator that skips simulation relies on rules 6, 8 and 9.
 
 ## Settlement logic
 
@@ -193,6 +227,9 @@ interface IEip3009ForwarderSplit {
 2. call `receiveWithAuthorization` on the token (funds move payer → forwarder);
 3. transfer `merchantValue` to `merchant` and `feeValue` to `feeReceiver` in the same
    transaction.
+
+The facilitator MUST perform full verification again during settlement and MUST NOT
+assume that a prior `/verify` result is still valid.
 
 The transaction submitter pays gas only and never controls funds. Settlement emits a
 single on-chain transaction containing both legs, which makes per-payment accounting and
